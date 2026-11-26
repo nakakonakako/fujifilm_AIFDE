@@ -166,6 +166,14 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask)
     pos = tr["label"].to_numpy() == 1
     w = np.where(pos, args.pos_frac / pos.mean(), (1 - args.pos_frac) / (1 - pos.mean()))
+    if args.hard_from:
+        # 前の実験の OOF で間違えやすかった実データを多めにサンプリング（疑似ラベル行は対象外）
+        prev = sigmoid(np.mean([pd.read_csv(OUT_DIR / e / "oof.csv")["logit"].to_numpy() for e in args.hard_from], 0))
+        p_prev = np.zeros(len(tr))
+        p_prev[:n_real] = prev[tr["index_in_train"].to_numpy()[:n_real].astype(int)]
+        err = np.where(pos, 1 - p_prev, p_prev)
+        err[n_real:] = 0
+        w = w * (1 + args.hard_alpha * err)
     # 1エポックのサンプル数は実データ分に固定（疑似ラベル追加で学習時間を増やさない）
     sampler = WeightedRandomSampler(torch.as_tensor(w, dtype=torch.double), num_samples=n_real, replacement=True)
     kw = dict(num_workers=args.workers, pin_memory=True, persistent_workers=True)
@@ -240,6 +248,8 @@ def main():
     ap.add_argument("--tta", type=int, default=8)
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--hard-from", nargs="*", default=[], help="難例の重み付けに使うOOFの実験名")
+    ap.add_argument("--hard-alpha", type=float, default=5.0)
     ap.add_argument("--full", type=int, default=0, help="全データ学習するモデル本数（0ならCV）")
     ap.add_argument("--mask", action="store_true", help="対象タイル範囲のマスクを4ch目として入力")
     ap.add_argument("--jitter", type=int, default=24)
