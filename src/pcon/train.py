@@ -37,7 +37,8 @@ def make_folds(train: pd.DataFrame, n_folds: int, seed: int) -> np.ndarray:
 
 
 class TileDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, store: MosaicStore, margin: int, size: int, train: bool, jitter: int = 24):
+    def __init__(self, df: pd.DataFrame, store: MosaicStore, margin: int, size: int, train: bool, jitter: int = 24,
+                 scale_max: float = 1.0, mask: bool = False):
         self.photo = df["photo"].to_numpy()
         self.gx = df["gx"].to_numpy()
         self.gy = df["gy"].to_numpy()
@@ -47,20 +48,36 @@ class TileDataset(Dataset):
         self.size = size
         self.train = train
         self.jitter = jitter if train else 0
+        # 撮影距離の違い（Pコン跡の見かけの大きさ）に対する拡大縮小。縮小側（視野を広げる）のみ
+        self.scale_max = scale_max if train else 1.0
+        # 対象タイルの範囲を示す4ch目（平行移動・拡大縮小しても境界の位置をモデルに伝える）
+        self.mask = mask
 
     def __len__(self) -> int:
         return len(self.photo)
 
     def __getitem__(self, i: int):
         m, j = self.margin, self.jitter
-        img = crop_context(self.store, self.photo[i], int(self.gx[i]), int(self.gy[i]), m + j)
+        base = 256 + 2 * m
+        extra = int(np.ceil(base * (self.scale_max - 1) / 2))
+        img = crop_context(self.store, self.photo[i], int(self.gx[i]), int(self.gy[i]), m + j + extra)
+        if self.mask:
+            off = m + j + extra
+            mk = np.zeros(img.shape[:2], np.uint8)
+            mk[off : off + 256, off : off + 256] = 255
+            img = np.concatenate([img, mk[..., None]], axis=2)
         if self.train:
-            # 平行移動の揺らぎ（対象タイルの中心付近を保つ範囲）
-            dy, dx = np.random.randint(0, 2 * j + 1, size=2)
-            img = img[dy : dy + img.shape[0] - 2 * j, dx : dx + img.shape[1] - 2 * j]
-            img = self._photometric(img)
+            # 視野サイズ L を [base, base*scale_max] から選び、中心付近を平行移動の揺らぎ付きで切り出す
+            L = int(np.random.uniform(base, base * self.scale_max)) if self.scale_max > 1 else base
+            c = img.shape[0] // 2
+            dy, dx = np.random.randint(-j, j + 1, size=2)
+            y0, x0 = c - L // 2 + dy, c - L // 2 + dx
+            img = img[y0 : y0 + L, x0 : x0 + L]
+            img = np.concatenate([self._photometric(img[..., :3]), img[..., 3:]], axis=2)
         if img.shape[0] != self.size:
             img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_AREA)
+            if img.ndim == 2:
+                img = img[..., None]
         x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)  # uint8 CHW
         return x, self.label[i]
 
@@ -144,16 +161,17 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     if pseudo is not None:
         tr = pd.concat([tr, pseudo], ignore_index=True)
 
-    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True)
+    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask)
     pos = tr["label"].to_numpy() == 1
     w = np.where(pos, args.pos_frac / pos.mean(), (1 - args.pos_frac) / (1 - pos.mean()))
     # 1エポックのサンプル数は実データ分に固定（疑似ラベル追加で学習時間を増やさない）
     sampler = WeightedRandomSampler(torch.as_tensor(w, dtype=torch.double), num_samples=n_real, replacement=True)
     kw = dict(num_workers=args.workers, pin_memory=True, persistent_workers=True)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, sampler=sampler, drop_last=True, **kw)
-    dl_va = DataLoader(TileDataset(va, store, args.margin, args.size, train=False), batch_size=args.bs * 2, **kw)
+    dl_va = DataLoader(TileDataset(va, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
 
-    model = timm.create_model(args.arch, pretrained=False, num_classes=1, drop_rate=0.2, drop_path_rate=0.1)
+    model = timm.create_model(args.arch, pretrained=False, num_classes=1, drop_rate=0.2, drop_path_rate=0.1,
+                              in_chans=4 if args.mask else 3)
     model = model.to(device).to(memory_format=torch.channels_last)
     ema = ModelEmaV3(model, decay=args.ema, use_warmup=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -193,7 +211,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
 
     torch.save(ema.module.state_dict(), exp_dir / f"model_f{fold}.pt")
     oof = predict(ema.module, dl_va, device, tta=args.tta)
-    dl_te = DataLoader(TileDataset(test, store, args.margin, args.size, train=False), batch_size=args.bs * 2, **kw)
+    dl_te = DataLoader(TileDataset(test, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
     te = predict(ema.module, dl_te, device, tta=args.tta)
     return va.index_in_train.to_numpy(), oof, te, log
 
@@ -217,6 +235,9 @@ def main():
     ap.add_argument("--tta", type=int, default=8)
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--mask", action="store_true", help="対象タイル範囲のマスクを4ch目として入力")
+    ap.add_argument("--jitter", type=int, default=24)
+    ap.add_argument("--scale-max", type=float, default=1.0, help="学習時に視野を最大何倍まで広げるか")
     ap.add_argument("--pseudo", nargs="*", default=[], help="疑似ラベルに使うテスト予測の実験名")
     ap.add_argument("--pseudo-lo", type=float, default=0.02)
     ap.add_argument("--pseudo-hi", type=float, default=0.9)
