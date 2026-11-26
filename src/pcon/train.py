@@ -38,7 +38,7 @@ def make_folds(train: pd.DataFrame, n_folds: int, seed: int) -> np.ndarray:
 
 class TileDataset(Dataset):
     def __init__(self, df: pd.DataFrame, store: MosaicStore, margin: int, size: int, train: bool, jitter: int = 24,
-                 scale_max: float = 1.0, mask: bool = False, pad: str = "edge"):
+                 scale_max: float = 1.0, mask: bool = False, pad: str = "edge", stripe: float = 0.0):
         self.photo = df["photo"].to_numpy()
         self.gx = df["gx"].to_numpy()
         self.gy = df["gy"].to_numpy()
@@ -53,6 +53,8 @@ class TileDataset(Dataset):
         # 対象タイルの範囲を示す4ch目（平行移動・拡大縮小しても境界の位置をモデルに伝える）
         self.mask = mask
         self.pad = pad
+        # 帯状の暗い物体（型枠跡・配管など）を合成してPコン跡と区別させる拡張の確率
+        self.stripe = stripe if train else 0.0
 
     def __len__(self) -> int:
         return len(self.photo)
@@ -74,13 +76,30 @@ class TileDataset(Dataset):
             dy, dx = np.random.randint(-j, j + 1, size=2)
             y0, x0 = c - L // 2 + dy, c - L // 2 + dx
             img = img[y0 : y0 + L, x0 : x0 + L]
-            img = np.concatenate([self._photometric(img[..., :3]), img[..., 3:]], axis=2)
+            rgb = img[..., :3]
+            if self.stripe > 0 and np.random.rand() < self.stripe:
+                rgb = self._add_stripe(rgb)
+            img = np.concatenate([self._photometric(rgb), img[..., 3:]], axis=2)
         if img.shape[0] != self.size:
             img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_AREA)
             if img.ndim == 2:
                 img = img[..., None]
         x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)  # uint8 CHW
         return x, self.label[i]
+
+    @staticmethod
+    def _add_stripe(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        canvas = np.zeros((h, w), np.uint8)
+        ang = np.random.uniform(0, np.pi)
+        cx, cy = np.random.uniform(0, w), np.random.uniform(0, h)
+        d = np.array([np.cos(ang), np.sin(ang)]) * 2 * max(h, w)
+        p1 = (int(cx - d[0]), int(cy - d[1]))
+        p2 = (int(cx + d[0]), int(cy + d[1]))
+        cv2.line(canvas, p1, p2, 255, int(np.random.uniform(25, 90)))
+        a = cv2.GaussianBlur(canvas, (0, 0), 2).astype(np.float32)[..., None] / 255 * np.random.uniform(0.4, 0.7)
+        out = img.astype(np.float32) * (1 - a) + img.astype(np.float32) * np.random.uniform(0.35, 0.6) * a
+        return out.clip(0, 255).astype(np.uint8)
 
     @staticmethod
     def _photometric(img: np.ndarray) -> np.ndarray:
@@ -164,7 +183,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     if pseudo is not None:
         tr = pd.concat([tr, pseudo], ignore_index=True)
 
-    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask, pad=args.pad)
+    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask, pad=args.pad, stripe=args.stripe)
     pos = tr["label"].to_numpy() == 1
     w = np.where(pos, args.pos_frac / pos.mean(), (1 - args.pos_frac) / (1 - pos.mean()))
     if args.hard_from:
@@ -252,6 +271,7 @@ def main():
     ap.add_argument("--hard-from", nargs="*", default=[], help="難例の重み付けに使うOOFの実験名")
     ap.add_argument("--hard-alpha", type=float, default=5.0)
     ap.add_argument("--full", type=int, default=0, help="全データ学習するモデル本数（0ならCV）")
+    ap.add_argument("--stripe", type=float, default=0.0, help="帯状の暗い物体を合成する確率")
     ap.add_argument("--pad", choices=["edge", "mean"], default="edge", help="写真外の埋め方")
     ap.add_argument("--mask", action="store_true", help="対象タイル範囲のマスクを4ch目として入力")
     ap.add_argument("--jitter", type=int, default=24)
