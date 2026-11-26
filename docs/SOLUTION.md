@@ -1,6 +1,6 @@
-# 解答の説明（提出 v11）
+# 解答の説明（提出 v21）
 
-対象の提出: `submissions/11_r18_m64_hard_s7_oof0.880.csv`（public 0.9333）
+対象の提出: `submissions/21_ens_stripe+best_pos1.92_interim.csv`（public 0.9333）
 
 ## ソースコード
 
@@ -11,6 +11,7 @@ https://github.com/nakakonakako/fujifilm_AIFDE/tree/feat/pcon-baseline
 ### 動作環境
 
 - Windows 11 + WSL2（Ubuntu）、NVIDIA GeForce RTX 3060 Ti（8GB）、CPU 20コア、メモリ 16GB
+  - 一部の学習は研究室サーバ（Ubuntu、RTX 4090）で同じコードを実行
 - Python 3.12、uv（パッケージ管理）
 - PyTorch 2.14.1（CUDA 13.0）、timm 1.0.31、scikit-learn、OpenCV、pandas（`pyproject.toml` / `uv.lock` で固定）
   - CUDA 12.x ドライバの環境では `pyproject.toml` の `cu130` を `cu126` に置き換えて `uv lock && uv sync`
@@ -26,22 +27,21 @@ uv sync
 #    SDNET2018 の DATA_Maguire_20180517_ALL.zip を data/ で展開し、
 #    中の SDNET2018.zip も同じ場所で展開（data/DATA_Maguire_20180517_ALL/W/... となる配置）
 
-# 3. タイルから元写真（横18×縦14タイル）を復元したキャッシュを作成（data/cache/, 約3.5GB）
-uv run python -m src.pcon.data
-
-# 4. ベースラインの5-fold学習（約60分）。OOF予測を手順5の難例重み付けに使う
-uv run python -m src.pcon.train --exp base_r18_m64
-
-# 5. 難例重み付けモデルの5-fold学習（seed 7, 約60分）
-uv run python -m src.pcon.train --exp r18_m64_hard_s7 --hard-from base_r18_m64 --seed 7 --epochs 30 --eval-every 5
-
-# 6. 提出CSV作成（5 foldモデルの平均、閾値はOOFのF1最大点 0.706）
-uv run python -m src.pcon.make_sub --exps r18_m64_hard_s7 --out submission.csv
-uv run python -m src.pcon.check_submission submission.csv
+# 3. 学習から提出CSV作成まで一括実行（RTX 3060 Ti 1枚で約8時間、RTX 4090 で約3時間）
+bash scripts/run_v21.sh
 ```
 
-- 所要時間は RTX 3060 Ti で合計約2時間
+`scripts/run_v21.sh` の中身:
+
+1. `src.pcon.data`: タイルから元写真（横18×縦14タイル）を復元したキャッシュを作成
+2. ベースライン（`base_r18_m64`）を5-fold学習。OOF予測を難例重み付けに使う
+3. 難例重み付けモデルの5-fold学習 × 4（seed 42 / 7 / 11、位置揺らぎなし）
+4. 帯状物体の合成拡張つきモデルの5-fold学習（`--stripe 0.3`、v21 では fold0〜2 を使用）
+5. 全データ学習（検証なし）× 13本
+6. `scripts/make_v21.py`: 帯の合成モデル群と重点学習モデル群のテスト予測（logit）をそれぞれ平均して半々で混ぜ、テスト陽性率が学習データの陽性率（1.92%）と同じになる閾値（0.616）で二値化
+
 - GPU の非決定的演算（cuDNN）を使うため、再実行時に予測が数タイル程度ずれることがある
+- 学習済みの予測ファイルがあれば、`uv run python scripts/make_v21.py --out submission.csv` だけで提出CSVを再作成できる
 
 ### 主な設定
 
@@ -51,8 +51,8 @@ uv run python -m src.pcon.check_submission submission.csv
 | 入力 | 対象タイル + 周囲64px（384×384） |
 | 学習 | AdamW（lr 2e-3, weight decay 0.05）、cosine学習率（2エポックのwarmup）、30エポック、batch 48、bf16、EMA 0.999 |
 | サンプリング | 陽性約15%になる重み付きサンプリング × 難例重み（最大6倍） |
-| データ拡張 | 反転・90°回転の8通り、平行移動±24px、明るさ・コントラスト・色・グレー化、ぼかし、ノイズ |
-| 推論 | 8通りのTTA、5 foldモデルの平均 |
+| データ拡張 | 反転・90°回転の8通り、平行移動（±24px または なし）、明るさ・コントラスト・色・グレー化、ぼかし、ノイズ、帯状の暗い物体の合成（30%） |
+| 推論 | 8通りのTTA、foldモデル・全データ学習モデルの平均 |
 | 検証 | 撮影元の写真単位の5-fold（StratifiedGroupKFold） |
 
 ## 創意工夫
@@ -66,11 +66,14 @@ uv run python -m src.pcon.check_submission submission.csv
 3. **難例重み付け（ハードエグザンプルマイニング）**
    ベースラインのOOF予測で間違えやすかったタイル（境界ぎりぎりのPコン跡、靴などの暗い物体、気泡など）を最大6倍の頻度で学習させました。OOF予測はそのタイルを学習していないモデルの出力なので、難しさを公平に測れます。この施策でpublicスコアがベースラインの0.871から0.921〜0.933に改善しました。
 
-4. **エラー分析とモデルの可視化に基づく改善**
-   見逃し・誤検出を周辺込みの画像で一覧化して分類（境界ぎりぎり、遠くの小さなPコン跡、暗い物体、写真端のパディングによる模様など）し、Grad-CAMでモデルが「明暗の境界の曲線」を手がかりにしていることを確認したうえで、データ拡張や入力の設計を見直しました。
+4. **Grad-CAM によるモデル分析と、帯状物体の合成拡張**
+   Grad-CAMで、モデルが「明るい壁面と暗い物体の境目（特に曲線）」を手がかりにしており、靴・配管・壁面の帯などの暗い物体の縁をPコン跡と誤認していることを確認しました。学習データにこうした物体がほとんどないことが原因と考え、ランダムな角度・幅・濃さの暗い帯を合成するデータ拡張を追加しました。単体モデルのOOF F1は 0.882 から 0.892 に改善し、評価用画像でも帯状の物体への誤検出が減りました。
 
-5. **事前学習なしの条件に合わせた設計**
-   小規模データでは大きなモデル（ResNet34）よりResNet18が良いことを検証で確認し、EMA・データ拡張・TTAでランダム初期化からの学習を安定させました。
+5. **境界判定の安定化と閾値の決め方**
+   境界ぎりぎりのPコン跡の判定が誤りの大半を占めていたため、学習時の位置の揺らぎをなくしたモデルを加えました。また、OOFのF1が広い閾値範囲でほぼ一定だったことから、その範囲内でテストの陽性率が学習データの陽性率と一致する閾値を選び、閾値の偶然のぶれに頼らない決め方にしました。
+
+6. **事前学習なしの条件に合わせた設計**
+   小規模データでは大きなモデル（ResNet34）よりResNet18が良いことを検証で確認し、EMA・データ拡張・TTA・多数モデルのアンサンブルでランダム初期化からの学習を安定させました。
 
 ## 実験の記録
 

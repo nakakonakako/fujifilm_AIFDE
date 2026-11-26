@@ -2,7 +2,7 @@
 
 問題文は `fujifilm_ai_fde_hackathon_pcon.md` を参照。
 
-## 動作環境（提出 v11 を作成した環境）
+## 動作環境
 
 - Windows 11 + WSL2 (Ubuntu), NVIDIA GeForce RTX 3060 Ti (8GB), CPU 20コア, メモリ 16GB
 - Python 3.12, [uv](https://docs.astral.sh/uv/)
@@ -10,30 +10,15 @@
   - CUDA 12.x ドライバの環境では `pyproject.toml` の `cu130` を `cu126` に変えて `uv lock && uv sync`
 - 事前学習済みモデル・外部データは不使用（すべてランダム初期化から学習）
 
-## 再現手順（提出 v11: `submissions/11_r18_m64_hard_s7_oof0.880.csv`）
+## 再現手順（最終提出 v21: `submissions/21_ens_stripe+best_pos1.92_interim.csv`）
 
 ```bash
-# 1. 環境構築
 uv sync
-
-# 2. データ配置: SDNET2018 を展開し data/DATA_Maguire_20180517_ALL/W/... となるようにする
-#    （DATA_Maguire_20180517_ALL.zip を data/ で展開し、中の SDNET2018.zip も同じ場所で展開）
-
-# 3. タイルから元写真（18x14タイル）を復元したキャッシュを作成（data/cache/, 約3.5GB）
-uv run python -m src.pcon.data
-
-# 4. ベースラインの5-fold学習（OOF予測を難例重み付けに使う）  RTX 3060 Ti で約60分
-uv run python -m src.pcon.train --exp base_r18_m64
-
-# 5. 難例重み付けモデルの5-fold学習（seed 7）  約60分
-uv run python -m src.pcon.train --exp r18_m64_hard_s7 --hard-from base_r18_m64 --seed 7 --epochs 30 --eval-every 5
-
-# 6. 提出CSV作成（5 foldモデルの平均、閾値はOOFのF1最大点 = 0.706）
-uv run python -m src.pcon.make_sub --exps r18_m64_hard_s7 --out submission.csv
-uv run python -m src.pcon.check_submission submission.csv
+# SDNET2018 を展開し data/DATA_Maguire_20180517_ALL/W/... となるように配置
+bash scripts/run_v21.sh   # 学習（15実験）→ submission.csv 作成
 ```
 
-GPU の非決定的な演算（cuDNN）を使っているため、再実行時の予測は数タイル程度ずれることがあります。
+詳細は `docs/SOLUTION.md` を参照。GPU の非決定的な演算（cuDNN）を使っているため、再実行時の予測は数タイル程度ずれることがあります。
 
 ## 構成
 
