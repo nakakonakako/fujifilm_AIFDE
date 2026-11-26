@@ -31,6 +31,7 @@ def main():
     exp_dir = OUT_DIR / a.exp
     args = SimpleNamespace(**json.loads((exp_dir / "args.json").read_text()))
     mask = getattr(args, "mask", False)
+    pad = getattr(args, "pad", "edge")
     train, test = load_tables()
     train["fold"] = make_folds(train, args.n_folds, seed=42)
     store = build_mosaics()
@@ -46,9 +47,9 @@ def main():
             model.load_state_dict(torch.load(exp_dir / f"model_f{k}.pt", map_location="cpu"))
             model = model.to(device).to(memory_format=torch.channels_last).eval()
             m = (train.fold == k).to_numpy()
-            dl = DataLoader(TileDataset(train[m], store, args.margin, size, train=False, mask=mask), batch_size=64, **kw)
+            dl = DataLoader(TileDataset(train[m], store, args.margin, size, train=False, mask=mask, pad=pad), batch_size=64, **kw)
             oof[m] = predict(model, dl, device, a.tta)
-            dl = DataLoader(TileDataset(test, store, args.margin, size, train=False, mask=mask), batch_size=64, **kw)
+            dl = DataLoader(TileDataset(test, store, args.margin, size, train=False, mask=mask, pad=pad), batch_size=64, **kw)
             tests.append(predict(model, dl, device, a.tta))
             print(f"z={z} fold{k} done", flush=True)
         pd.DataFrame(dict(path=train["path"], label=train["label"], fold=train["fold"], logit=oof)).to_csv(

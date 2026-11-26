@@ -80,7 +80,7 @@ def build_mosaics(force: bool = False) -> MosaicStore:
     return MosaicStore(images=images, valid=valid, photo_to_slot=slot)
 
 
-def crop_context(store: MosaicStore, photo: str, gx: int, gy: int, margin: int) -> np.ndarray:
+def crop_context(store: MosaicStore, photo: str, gx: int, gy: int, margin: int, pad: str = "edge") -> np.ndarray:
     """対象タイルの周囲 margin px を含めた切り出し。写真外は端の延長、欠損タイルは平均色で埋める。"""
     s = store.photo_to_slot[photo]
     img = store.images[s]
@@ -93,6 +93,15 @@ def crop_context(store: MosaicStore, photo: str, gx: int, gy: int, margin: int) 
     out = np.asarray(img[ys[0] : ys[-1] + 1, xs[0] : xs[-1] + 1])
     if out.shape[:2] != (size, size):
         out = out[np.ix_(ys - ys[0], xs - xs[0])]
+        if pad == "mean":
+            # 端の延長は筋状の模様を作り誤検出の原因になるため、写真外を対象タイルの平均色で埋める
+            out = out.copy()
+            c0 = gy * TILE - y0, gx * TILE - x0
+            mean = out[c0[0] : c0[0] + TILE, c0[1] : c0[1] + TILE].reshape(-1, 3).mean(0).astype(np.uint8)
+            outside_y = (np.arange(y0, y0 + size) < 0) | (np.arange(y0, y0 + size) >= H)
+            outside_x = (np.arange(x0, x0 + size) < 0) | (np.arange(x0, x0 + size) >= W)
+            out[outside_y] = mean
+            out[:, outside_x] = mean
     # 欠損タイル部分は対象タイルの平均色で埋める
     v = store.valid[s]
     if not v.all():

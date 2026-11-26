@@ -38,7 +38,7 @@ def make_folds(train: pd.DataFrame, n_folds: int, seed: int) -> np.ndarray:
 
 class TileDataset(Dataset):
     def __init__(self, df: pd.DataFrame, store: MosaicStore, margin: int, size: int, train: bool, jitter: int = 24,
-                 scale_max: float = 1.0, mask: bool = False):
+                 scale_max: float = 1.0, mask: bool = False, pad: str = "edge"):
         self.photo = df["photo"].to_numpy()
         self.gx = df["gx"].to_numpy()
         self.gy = df["gy"].to_numpy()
@@ -52,6 +52,7 @@ class TileDataset(Dataset):
         self.scale_max = scale_max if train else 1.0
         # 対象タイルの範囲を示す4ch目（平行移動・拡大縮小しても境界の位置をモデルに伝える）
         self.mask = mask
+        self.pad = pad
 
     def __len__(self) -> int:
         return len(self.photo)
@@ -60,7 +61,7 @@ class TileDataset(Dataset):
         m, j = self.margin, self.jitter
         base = 256 + 2 * m
         extra = int(np.ceil(base * (self.scale_max - 1) / 2))
-        img = crop_context(self.store, self.photo[i], int(self.gx[i]), int(self.gy[i]), m + j + extra)
+        img = crop_context(self.store, self.photo[i], int(self.gx[i]), int(self.gy[i]), m + j + extra, self.pad)
         if self.mask:
             off = m + j + extra
             mk = np.zeros(img.shape[:2], np.uint8)
@@ -163,7 +164,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     if pseudo is not None:
         tr = pd.concat([tr, pseudo], ignore_index=True)
 
-    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask)
+    ds_tr = TileDataset(tr, store, args.margin, args.size, train=True, jitter=args.jitter, scale_max=args.scale_max, mask=args.mask, pad=args.pad)
     pos = tr["label"].to_numpy() == 1
     w = np.where(pos, args.pos_frac / pos.mean(), (1 - args.pos_frac) / (1 - pos.mean()))
     if args.hard_from:
@@ -179,7 +180,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     kw = dict(num_workers=args.workers, pin_memory=True, persistent_workers=True)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, sampler=sampler, drop_last=True, **kw)
     dl_va = None if full else DataLoader(
-        TileDataset(va, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
+        TileDataset(va, store, args.margin, args.size, train=False, mask=args.mask, pad=args.pad), batch_size=args.bs * 2, **kw)
 
     model = timm.create_model(args.arch, pretrained=False, num_classes=1, drop_rate=0.2, drop_path_rate=0.1,
                               in_chans=4 if args.mask else 3)
@@ -224,7 +225,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
 
     torch.save(ema.module.state_dict(), exp_dir / f"model_f{fold}.pt")
     oof = np.zeros(0) if full else predict(ema.module, dl_va, device, tta=args.tta)
-    dl_te = DataLoader(TileDataset(test, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
+    dl_te = DataLoader(TileDataset(test, store, args.margin, args.size, train=False, mask=args.mask, pad=args.pad), batch_size=args.bs * 2, **kw)
     te = predict(ema.module, dl_te, device, tta=args.tta)
     return va.index_in_train.to_numpy(), oof, te, log
 
@@ -251,6 +252,7 @@ def main():
     ap.add_argument("--hard-from", nargs="*", default=[], help="難例の重み付けに使うOOFの実験名")
     ap.add_argument("--hard-alpha", type=float, default=5.0)
     ap.add_argument("--full", type=int, default=0, help="全データ学習するモデル本数（0ならCV）")
+    ap.add_argument("--pad", choices=["edge", "mean"], default="edge", help="写真外の埋め方")
     ap.add_argument("--mask", action="store_true", help="対象タイル範囲のマスクを4ch目として入力")
     ap.add_argument("--jitter", type=int, default=24)
     ap.add_argument("--scale-max", type=float, default=1.0, help="学習時に視野を最大何倍まで広げるか")
