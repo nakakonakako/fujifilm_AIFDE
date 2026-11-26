@@ -1,0 +1,28 @@
+[project]
+name = "pcon"
+version = "0.1.0"
+description = "Pコン跡認識（富士フイルム AI FDEハッカソン）"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.5",
+    "opencv-python-headless>=5.1.0.95",
+    "pandas>=3.1.1",
+    "pillow>=13.0.0",
+    "scikit-learn>=1.9.1",
+    "timm>=1.0.31",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "tqdm>=4.70.1",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
