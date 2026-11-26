@@ -155,8 +155,10 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     device = torch.device("cuda")
     torch.manual_seed(args.seed + fold)
     np.random.seed(args.seed + fold)
+    # fold < 0 は全データ学習（検証なし）
     tr = train[train.fold != fold].reset_index(drop=True)
     va = train[train.fold == fold].reset_index(drop=True)
+    full = len(va) == 0
     n_real = len(tr)
     if pseudo is not None:
         tr = pd.concat([tr, pseudo], ignore_index=True)
@@ -168,7 +170,8 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
     sampler = WeightedRandomSampler(torch.as_tensor(w, dtype=torch.double), num_samples=n_real, replacement=True)
     kw = dict(num_workers=args.workers, pin_memory=True, persistent_workers=True)
     dl_tr = DataLoader(ds_tr, batch_size=args.bs, sampler=sampler, drop_last=True, **kw)
-    dl_va = DataLoader(TileDataset(va, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
+    dl_va = None if full else DataLoader(
+        TileDataset(va, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
 
     model = timm.create_model(args.arch, pretrained=False, num_classes=1, drop_rate=0.2, drop_path_rate=0.1,
                               in_chans=4 if args.mask else 3)
@@ -201,7 +204,9 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
             step += 1
             ema.update(model, step=step)
             tot += loss.item()
-        if ep % args.eval_every == args.eval_every - 1 or ep == args.epochs - 1:
+        if full:
+            print(f"[full{fold}] ep{ep:02d} loss {tot / len(dl_tr):.4f} ({time.time()-t0:.0f}s)", flush=True)
+        elif ep % args.eval_every == args.eval_every - 1 or ep == args.epochs - 1:
             p = sigmoid(predict(ema.module, dl_va, device, tta=1))
             yv = va["label"].to_numpy()
             f, t = best_f1(yv, p)
@@ -210,7 +215,7 @@ def train_fold(args, fold: int, train: pd.DataFrame, test: pd.DataFrame, store: 
             print(f"[fold{fold}] ep{ep:02d} loss {rec['loss']:.4f} ap {rec['ap']:.4f} f1 {f:.4f}@{t:.3f} ({time.time()-t0:.0f}s)", flush=True)
 
     torch.save(ema.module.state_dict(), exp_dir / f"model_f{fold}.pt")
-    oof = predict(ema.module, dl_va, device, tta=args.tta)
+    oof = np.zeros(0) if full else predict(ema.module, dl_va, device, tta=args.tta)
     dl_te = DataLoader(TileDataset(test, store, args.margin, args.size, train=False, mask=args.mask), batch_size=args.bs * 2, **kw)
     te = predict(ema.module, dl_te, device, tta=args.tta)
     return va.index_in_train.to_numpy(), oof, te, log
@@ -235,6 +240,7 @@ def main():
     ap.add_argument("--tta", type=int, default=8)
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--full", type=int, default=0, help="全データ学習するモデル本数（0ならCV）")
     ap.add_argument("--mask", action="store_true", help="対象タイル範囲のマスクを4ch目として入力")
     ap.add_argument("--jitter", type=int, default=24)
     ap.add_argument("--scale-max", type=float, default=1.0, help="学習時に視野を最大何倍まで広げるか")
@@ -254,6 +260,16 @@ def main():
     store = build_mosaics()
 
     pseudo = load_pseudo(test, args.pseudo, args.pseudo_lo, args.pseudo_hi) if args.pseudo else None
+    if args.full:
+        # 全データ学習: seed を変えて複数本。閾値は対応するCV実験のOOFから決める
+        tests = []
+        for k in range(args.full):
+            args.seed += 1000 * (k + 1)
+            _, _, t, _ = train_fold(args, -1 - k, train, test, store, exp_dir, pseudo)
+            tests.append(t)
+            np.save(exp_dir / f"test_logit_full{k}.npy", t)
+        pd.DataFrame(dict(path=test["path"], logit=np.mean(tests, 0))).to_csv(exp_dir / "test_logit.csv", index=False)
+        return
     folds = range(args.n_folds) if args.folds == "all" else [int(f) for f in args.folds.split(",")]
     oof = np.full(len(train), np.nan)
     tests, logs = [], {}
